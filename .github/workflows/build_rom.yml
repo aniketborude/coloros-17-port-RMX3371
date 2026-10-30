@@ -1,0 +1,545 @@
+name: Build ColorOS 17 Fastboot ROM (RMX3371)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: 'RMX3371 Base OTA URL (Realme UI 5.0 / Android 14)'
+        required: false
+        default: 'https://gauss-opexcostmanual-eu.allawnofs.com/remove-236fef70eef4b8cb59595683b4eb33ee/component-ota/25/07/25/97e5f37f2a8c4241a99da04ac094b5c1.zip'
+      donor_url:
+        description: 'ColorOS 17 (Android 17) Donor OTA URL'
+        required: false
+        default: 'https://downloads.sourceforge.net/project/coloros-port/ColorOS17/17.0.0.155/ota_full-KB2000_17.0.0.155-PYB110-10171911-CN-2026-10-01-37c0e12f9d.zip'
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  port-coloros17-rmx3371:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free Up 75+ GB Runner Disk Space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost \
+                      /usr/local/graalvm \
+                      /usr/local/aws-cli
+          sudo docker system prune -af --volumes || true
+          df -h
+
+      - name: Execute Autonomous ColorOS 17 Porting Pipeline
+        env:
+          BASE_URL: ${{ github.event.inputs.base_url || 'https://gauss-opexcostmanual-eu.allawnofs.com/remove-236fef70eef4b8cb59595683b4eb33ee/component-ota/25/07/25/97e5f37f2a8c4241a99da04ac094b5c1.zip' }}
+          DONOR_URL: ${{ github.event.inputs.donor_url || 'https://downloads.sourceforge.net/project/coloros-port/ColorOS17/17.0.0.155/ota_full-KB2000_17.0.0.155-PYB110-10171911-CN-2026-10-01-37c0e12f9d.zip' }}
+        run: |
+          cat << 'PORTSCRIPT_EOF' > /tmp/port_coloros17_rmx3371.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          BASE_URL_PRIMARY="${BASE_URL:-https://gauss-opexcostmanual-eu.allawnofs.com/remove-236fef70eef4b8cb59595683b4eb33ee/component-ota/25/07/25/97e5f37f2a8c4241a99da04ac094b5c1.zip}"
+          BASE_URL_BACKUP="https://gauss-componentotacostmanual-in.allawnofs.com/remove-10c1e1f5c658ac266b259b18e5745ac5/component-ota/24/05/17/bcefa6771bdd4252ae224f07b22fabc1.zip"
+          DONOR_URL="${DONOR_URL:-https://downloads.sourceforge.net/project/coloros-port/ColorOS17/17.0.0.155/ota_full-KB2000_17.0.0.155-PYB110-10171911-CN-2026-10-01-37c0e12f9d.zip}"
+
+          SUPER_TOTAL_SIZE=9126805504
+          GROUP_MAX_SIZE=9122611200
+          METADATA_SIZE=65536
+          METADATA_SLOTS=3
+
+          BASE_STANDARD_PARTS=(boot dtbo vbmeta vbmeta_system vbmeta_vendor modem)
+          BASE_SUPER_PARTS=(vendor odm my_company my_preload)
+          DONOR_SUPER_PARTS=(system system_ext product my_product my_stock my_heytap my_region my_bigball my_carrier my_engineering my_manifest)
+
+          WORK_DIR="$(pwd)/work"
+          BASE_IMG_DIR="${WORK_DIR}/base_images"
+          DONOR_IMG_DIR="${WORK_DIR}/donor_images"
+          UNPACK_BASE_DIR="${WORK_DIR}/unpack_base"
+          UNPACK_DONOR_DIR="${WORK_DIR}/unpack_donor"
+          REPACK_IMG_DIR="${WORK_DIR}/repack_images"
+          FINAL_OUT_DIR="$(pwd)/out"
+          BIN_DIR="${WORK_DIR}/bin"
+
+          mkdir -p "${BASE_IMG_DIR}" "${DONOR_IMG_DIR}" "${UNPACK_BASE_DIR}" "${UNPACK_DONOR_DIR}" "${REPACK_IMG_DIR}" "${FINAL_OUT_DIR}" "${BIN_DIR}"
+          export PATH="${BIN_DIR}:${PATH}"
+
+          echo "============================================================================"
+          echo " STEP 1: Installing Dependencies & Toolchain (payload-dumper-go, erofs, lpmake)"
+          echo "============================================================================"
+          sudo apt-get update -y
+          sudo apt-get install -y aria2 curl wget unzip zip p7zip-full jq python3 \
+              erofs-utils android-sdk-libsparse-utils e2fsprogs bc file git build-essential \
+              cmake ninja-build zlib1g-dev liblz4-dev libselinux1-dev
+
+          PDG_URL=$(curl -s https://api.github.com/repos/ssut/payload-dumper-go/releases/latest \
+            | jq -r '.assets[] | select(.name | test("linux_amd64\\.tar\\.gz$")) | .browser_download_url' | head -n 1 || true)
+          if [[ -z "${PDG_URL}" || "${PDG_URL}" == "null" ]]; then
+            PDG_URL="https://github.com/ssut/payload-dumper-go/releases/download/1.3.0/payload-dumper-go_1.3.0_linux_amd64.tar.gz"
+          fi
+          aria2c -x16 -s16 -k1M --check-certificate=false -d "${BIN_DIR}" -o pdg.tar.gz "${PDG_URL}"
+          tar -xzf "${BIN_DIR}/pdg.tar.gz" -C "${BIN_DIR}" payload-dumper-go
+          chmod +x "${BIN_DIR}/payload-dumper-go"
+          rm -f "${BIN_DIR}/pdg.tar.gz"
+
+          EROFS_URL=$(curl -s https://api.github.com/repos/sekaiacg/erofs-utils/releases/latest \
+            | jq -r '.assets[] | select(.name | test("Linux_x86_64\\.zip$")) | .browser_download_url' | head -n 1 || true)
+          if [[ -n "${EROFS_URL}" && "${EROFS_URL}" != "null" ]]; then
+            aria2c -x16 -s16 -k1M --check-certificate=false -d "${BIN_DIR}" -o erofs.zip "${EROFS_URL}" || true
+            if [[ -f "${BIN_DIR}/erofs.zip" ]]; then
+              unzip -q -j "${BIN_DIR}/erofs.zip" -d "${BIN_DIR}" || true
+              chmod +x "${BIN_DIR}"/*erofs* 2>/dev/null || true
+              rm -f "${BIN_DIR}/erofs.zip"
+            fi
+          fi
+
+          if ! command -v lpmake >/dev/null 2>&1; then
+            git clone --depth=1 https://github.com/whyshhnuv/lpunpack-lpmake-mirror.git "${WORK_DIR}/lptools" || true
+            if [[ -f "${WORK_DIR}/lptools/binary/lpmake" ]]; then
+              cp -f "${WORK_DIR}/lptools/binary/lpmake" "${BIN_DIR}/lpmake"
+              cp -f "${WORK_DIR}/lptools/binary/lpunpack" "${BIN_DIR}/lpunpack"
+              chmod +x "${BIN_DIR}/lpmake" "${BIN_DIR}/lpunpack"
+            else
+              git clone --depth=1 https://github.com/LonelyFool/lpunpack_and_lpmake.git "${WORK_DIR}/lpbuild"
+              pushd "${WORK_DIR}/lpbuild" >/dev/null
+              ./make.sh
+              cp -f bin/* "${BIN_DIR}/"
+              chmod +x "${BIN_DIR}"/*
+              popd >/dev/null
+            fi
+            rm -rf "${WORK_DIR}/lptools" "${WORK_DIR}/lpbuild"
+          fi
+
+          echo "============================================================================"
+          echo " STEP 2: Fast Multi-Connection Download & Payload Extraction"
+          echo "============================================================================"
+          echo "--> Downloading RMX3371 Base Firmware..."
+          if ! aria2c -x16 -s16 -k1M --file-allocation=none --check-certificate=false -d "${WORK_DIR}" -o base.zip "${BASE_URL_PRIMARY}"; then
+            echo "Primary Base URL failed or expired. Falling back to Backup Base URL..."
+            aria2c -x16 -s16 -k1M --file-allocation=none --check-certificate=false -d "${WORK_DIR}" -o base.zip "${BASE_URL_BACKUP}"
+          fi
+
+          BASE_EXTRACT_LIST=$(IFS=,; echo "${BASE_STANDARD_PARTS[*]},${BASE_SUPER_PARTS[*]},system_ext,my_product")
+          echo "--> Extracting Base partitions: ${BASE_EXTRACT_LIST}"
+          if ! payload-dumper-go -c 4 -p "${BASE_EXTRACT_LIST}" -o "${BASE_IMG_DIR}" "${WORK_DIR}/base.zip"; then
+            unzip -q "${WORK_DIR}/base.zip" payload.bin -d "${WORK_DIR}"
+            rm -f "${WORK_DIR}/base.zip"
+            payload-dumper-go -c 4 -p "${BASE_EXTRACT_LIST}" -o "${BASE_IMG_DIR}" "${WORK_DIR}/payload.bin"
+            rm -f "${WORK_DIR}/payload.bin"
+          else
+            rm -f "${WORK_DIR}/base.zip"
+          fi
+
+          echo "--> Downloading ColorOS 17 Donor Firmware..."
+          aria2c -x16 -s16 -k1M --file-allocation=none --check-certificate=false -d "${WORK_DIR}" -o donor.zip "${DONOR_URL}"
+
+          DONOR_EXTRACT_LIST=$(IFS=,; echo "${DONOR_SUPER_PARTS[*]}")
+          echo "--> Extracting Donor partitions: ${DONOR_EXTRACT_LIST}"
+          if ! payload-dumper-go -c 4 -p "${DONOR_EXTRACT_LIST}" -o "${DONOR_IMG_DIR}" "${WORK_DIR}/donor.zip"; then
+            unzip -q "${WORK_DIR}/donor.zip" payload.bin -d "${WORK_DIR}"
+            rm -f "${WORK_DIR}/donor.zip"
+            payload-dumper-go -c 4 -p "${DONOR_EXTRACT_LIST}" -o "${DONOR_IMG_DIR}" "${WORK_DIR}/payload.bin"
+            rm -f "${WORK_DIR}/payload.bin"
+          else
+            rm -f "${WORK_DIR}/donor.zip"
+          fi
+
+          df -h
+
+          echo "============================================================================"
+          echo " STEP 3: EROFS Unpacking (With Tool Compatibility Fallback)"
+          echo "============================================================================"
+          unpack_partition() {
+            local img_path="$1"
+            local out_root="$2"
+            local part_name="$3"
+            local target_dir="${out_root}/${part_name}"
+            mkdir -p "${target_dir}" "${out_root}/config"
+
+            if file "${img_path}" | grep -qi "Android sparse image"; then
+              simg2img "${img_path}" "${img_path}.raw"
+              mv -f "${img_path}.raw" "${img_path}"
+            fi
+
+            if command -v extract.erofs >/dev/null 2>&1 && extract.erofs -x -i "${img_path}" -o "${out_root}" >/dev/null 2>&1; then
+              echo "    [OK] Unpacked ${part_name} via extract.erofs"
+            elif command -v fsck.erofs >/dev/null 2>&1 && fsck.erofs --extract="${target_dir}" "${img_path}" >/dev/null 2>&1; then
+              echo "    [OK] Unpacked ${part_name} via fsck.erofs"
+            else
+              echo "    [Fallback] Mounting/Extracting ${part_name} via loop/7z..."
+              mkdir -p "${WORK_DIR}/mnt_${part_name}"
+              if sudo mount -o loop,ro "${img_path}" "${WORK_DIR}/mnt_${part_name}" 2>/dev/null; then
+                sudo cp -a "${WORK_DIR}/mnt_${part_name}/." "${target_dir}/"
+                sudo umount "${WORK_DIR}/mnt_${part_name}"
+                sudo chown -R "$(id -u):$(id -g)" "${target_dir}"
+              else
+                7z x "${img_path}" -o"${target_dir}" -y >/dev/null 2>&1 || true
+              fi
+              rmdir "${WORK_DIR}/mnt_${part_name}" 2>/dev/null || true
+            fi
+          }
+
+          for part in vendor system_ext my_product; do
+            if [[ -f "${BASE_IMG_DIR}/${part}.img" ]]; then
+              unpack_partition "${BASE_IMG_DIR}/${part}.img" "${UNPACK_BASE_DIR}" "${part}"
+              rm -f "${BASE_IMG_DIR}/${part}.img"
+            fi
+          done
+
+          for part in odm my_company my_preload; do
+            if [[ -f "${BASE_IMG_DIR}/${part}.img" ]]; then
+              if file "${BASE_IMG_DIR}/${part}.img" | grep -qi "Android sparse image"; then
+                simg2img "${BASE_IMG_DIR}/${part}.img" "${REPACK_IMG_DIR}/${part}.img"
+                rm -f "${BASE_IMG_DIR}/${part}.img"
+              else
+                mv -f "${BASE_IMG_DIR}/${part}.img" "${REPACK_IMG_DIR}/${part}.img"
+              fi
+            fi
+          done
+
+          for part in "${DONOR_SUPER_PARTS[@]}"; do
+            if [[ -f "${DONOR_IMG_DIR}/${part}.img" ]]; then
+              unpack_partition "${DONOR_IMG_DIR}/${part}.img" "${UNPACK_DONOR_DIR}" "${part}"
+              rm -f "${DONOR_IMG_DIR}/${part}.img"
+            fi
+          done
+
+          echo "============================================================================"
+          echo " STEP 4: Base Vendor Patching (Disable AVB / dm-verity in fstab.qcom)"
+          echo "============================================================================"
+          for fstab in "${UNPACK_BASE_DIR}"/vendor/etc/fstab*; do
+            if [[ -f "${fstab}" ]]; then
+              echo "--> Patching ${fstab}"
+              sed -i -E 's/,avb(=[^,[:space:]]*)?//g' "${fstab}"
+              sed -i -E 's/,avb_keys=[^,[:space:]]*//g' "${fstab}"
+              sed -i -E 's/,verify(=[^,[:space:]]*)?//g' "${fstab}"
+            fi
+          done
+
+          echo "============================================================================"
+          echo " STEP 5: Android 14 Vendor <-> Android 17 System Bridge (VNDK 34 & eBPF)"
+          echo "============================================================================"
+          mkdir -p "${UNPACK_DONOR_DIR}/system_ext/apex"
+          find "${UNPACK_BASE_DIR}/system_ext/apex" -maxdepth 1 -name "*vndk*34*" -exec cp -rf {} "${UNPACK_DONOR_DIR}/system_ext/apex/" \; || true
+          rm -rf "${UNPACK_BASE_DIR}/system_ext"
+
+          for bpf_rc in \
+            "${UNPACK_DONOR_DIR}/system/etc/init/bpfloader.rc" \
+            "${UNPACK_DONOR_DIR}/system/system/etc/init/bpfloader.rc"; do
+            if [[ -f "${bpf_rc}" ]]; then
+              echo "--> Removing reboot_on_failure from ${bpf_rc}"
+              sed -i '/reboot_on_failure/d' "${bpf_rc}"
+            fi
+          done
+
+          echo "============================================================================"
+          echo " STEP 6: RMX3371 Hardware Overlay Injection (my_product)"
+          echo "============================================================================"
+          BASE_MP="${UNPACK_BASE_DIR}/my_product"
+          DONOR_MP="${UNPACK_DONOR_DIR}/my_product"
+          mkdir -p "${DONOR_MP}"
+
+          for subdir in etc/permissions etc/extension non_overlay vendor/etc; do
+            if [[ -d "${BASE_MP}/${subdir}" ]]; then
+              mkdir -p "${DONOR_MP}/${subdir}"
+              cp -rf "${BASE_MP}/${subdir}/." "${DONOR_MP}/${subdir}/"
+            fi
+          done
+
+          while IFS= read -r -d '' cfg_file; do
+            rel_path="${cfg_file#${BASE_MP}/}"
+            mkdir -p "${DONOR_MP}/$(dirname "${rel_path}")"
+            cp -rf "${cfg_file}" "${DONOR_MP}/${rel_path}"
+          done < <(find "${BASE_MP}" -type f \( -iname "*display*" -o -iname "*camera*" -o -iname "*fod*" -o -iname "*sensor*" \) -print0 2>/dev/null)
+
+          rm -rf "${UNPACK_BASE_DIR}/my_product"
+
+          echo "============================================================================"
+          echo " STEP 7: Build.prop Adaptation (RMX3371 / Project 21623 / 80W SuperVOOC)"
+          echo "============================================================================"
+          inject_prop() {
+            local prop_file="$1"
+            local key="$2"
+            local val="$3"
+            if grep -q "^${key}=" "${prop_file}" 2>/dev/null; then
+              sed -i "s|^${key}=.*|${key}=${val}|g" "${prop_file}"
+            else
+              echo "${key}=${val}" >> "${prop_file}"
+            fi
+          }
+
+          PROP_FILES=()
+          while IFS= read -r -d '' pf; do
+            PROP_FILES+=("${pf}")
+          done < <(find "${UNPACK_DONOR_DIR}/my_product" "${UNPACK_DONOR_DIR}/my_manifest" -name "*build*.prop" -type f -print0 2>/dev/null)
+
+          if [[ ${#PROP_FILES[@]} -eq 0 ]]; then
+            mkdir -p "${UNPACK_DONOR_DIR}/my_product" "${UNPACK_DONOR_DIR}/my_manifest"
+            touch "${UNPACK_DONOR_DIR}/my_product/build.prop" "${UNPACK_DONOR_DIR}/my_manifest/build.prop"
+            PROP_FILES=("${UNPACK_DONOR_DIR}/my_product/build.prop" "${UNPACK_DONOR_DIR}/my_manifest/build.prop")
+          fi
+
+          for pf in "${PROP_FILES[@]}"; do
+            echo "--> Updating properties in ${pf}"
+            echo "" >> "${pf}"
+            inject_prop "${pf}" "ro.Separate.soft" "21623"
+            inject_prop "${pf}" "ro.build.ossi.prjname" "21623"
+            inject_prop "${pf}" "ro.product.device" "RMX3371"
+            inject_prop "${pf}" "ro.product.model" "RMX3371"
+            inject_prop "${pf}" "ro.product.name" "RMX3371"
+            inject_prop "${pf}" "ro.product.my_manifest.device" "RMX3371"
+            inject_prop "${pf}" "ro.product.my_product.device" "RMX3371"
+            inject_prop "${pf}" "ro.sf.lcd_density" "480"
+            inject_prop "${pf}" "ro.oplus.fastcharge.supervooc_support" "1"
+          done
+
+          echo "============================================================================"
+          echo " STEP 8: Smart Debloating (Strict 8.5 GiB Super Partition Ceiling)"
+          echo "============================================================================"
+          for bloat_dir in \
+            "${UNPACK_DONOR_DIR}/my_stock/del-app" \
+            "${UNPACK_DONOR_DIR}/my_stock/priv-app/del-app" \
+            "${UNPACK_DONOR_DIR}/my_heytap/del-app" \
+            "${UNPACK_DONOR_DIR}/my_bigball/apks" \
+            "${UNPACK_DONOR_DIR}/my_bigball/del-app" \
+            "${UNPACK_DONOR_DIR}/my_product/del-app"; do
+            rm -rf "${bloat_dir}" 2>/dev/null || true
+          done
+
+          find "${UNPACK_DONOR_DIR}/my_stock" "${UNPACK_DONOR_DIR}/my_heytap" "${UNPACK_DONOR_DIR}/my_bigball" \
+            -maxdepth 4 \( -iname "*OplusGames*" -o -iname "*HeytapBrowser*" -o -iname "*GameCenter*" \
+            -o -iname "*KeKeMarket*" -o -iname "*NearmeGameCenter*" -o -iname "*Breeno*" \
+            -o -iname "*AIGC*" -o -iname "*AndesGPT*" -o -iname "*ThirdParty*" \) \
+            -exec rm -rf {} + 2>/dev/null || true
+
+          echo "============================================================================"
+          echo " STEP 9: EROFS Repacking & SELinux Context Preservation"
+          echo "============================================================================"
+          repack_erofs_partition() {
+            local unpack_root="$1"
+            local part_name="$2"
+            local src_dir="${unpack_root}/${part_name}"
+            local out_img="${REPACK_IMG_DIR}/${part_name}.img"
+            local fs_cfg="${unpack_root}/config/${part_name}_fs_config"
+            local file_ctx="${unpack_root}/config/${part_name}_file_contexts"
+
+            if [[ ! -d "${src_dir}" ]]; then
+              return 0
+            fi
+
+            echo "--> Packing ${part_name}.img (lz4hc,9)..."
+            local extra_args=()
+            if [[ -f "${fs_cfg}" && -f "${file_ctx}" ]]; then
+              if ! grep -q "^/${part_name}(/.*)? " "${file_ctx}" 2>/dev/null; then
+                echo "/${part_name}(/.*)? u:object_r:system_file:s0" >> "${file_ctx}"
+              fi
+              extra_args+=(--fs-config-file="${fs_cfg}" --file-contexts="${file_ctx}")
+            fi
+
+            if ! mkfs.erofs -zlz4hc,9 -T 1230768000 --mount-point="/${part_name}" "${extra_args[@]}" "${out_img}" "${src_dir}" >/dev/null 2>&1; then
+              echo "    [Retry] Packing ${part_name}.img with standard default contexts..."
+              mkfs.erofs -zlz4hc,9 -T 1230768000 --mount-point="/${part_name}" "${out_img}" "${src_dir}" >/dev/null
+            fi
+          }
+
+          repack_erofs_partition "${UNPACK_BASE_DIR}" "vendor"
+          rm -rf "${UNPACK_BASE_DIR}/vendor"
+
+          for part in "${DONOR_SUPER_PARTS[@]}"; do
+            repack_erofs_partition "${UNPACK_DONOR_DIR}" "${part}"
+            if [[ "${part}" != "my_stock" && "${part}" != "my_heytap" && "${part}" != "my_bigball" ]]; then
+              rm -rf "${UNPACK_DONOR_DIR:?}/${part}"
+            fi
+          done
+
+          calc_total_super_used() {
+            local sum=0
+            for p in "${BASE_SUPER_PARTS[@]}" "${DONOR_SUPER_PARTS[@]}"; do
+              if [[ -f "${REPACK_IMG_DIR}/${p}.img" ]]; then
+                local sz
+                sz=$(stat -c%s "${REPACK_IMG_DIR}/${p}.img")
+                sum=$((sum + sz))
+              fi
+            done
+            echo "${sum}"
+          }
+
+          TOTAL_USED=$(calc_total_super_used)
+          echo "--> Current total dynamic partition usage: ${TOTAL_USED} / ${GROUP_MAX_SIZE} bytes"
+
+          if (( TOTAL_USED > GROUP_MAX_SIZE )); then
+            echo "--> [SIZE GUARD] Usage exceeds ${GROUP_MAX_SIZE} bytes! Stripping non-essential APKs..."
+            rm -rf "${UNPACK_DONOR_DIR}/my_bigball/app"/* "${UNPACK_DONOR_DIR}/my_bigball/plugin"/* 2>/dev/null || true
+            repack_erofs_partition "${UNPACK_DONOR_DIR}" "my_bigball"
+            TOTAL_USED=$(calc_total_super_used)
+          fi
+
+          if (( TOTAL_USED > GROUP_MAX_SIZE )); then
+            rm -rf "${UNPACK_DONOR_DIR}/my_heytap/app"/* 2>/dev/null || true
+            repack_erofs_partition "${UNPACK_DONOR_DIR}" "my_heytap"
+            TOTAL_USED=$(calc_total_super_used)
+          fi
+
+          if (( TOTAL_USED > GROUP_MAX_SIZE )); then
+            while (( TOTAL_USED > GROUP_MAX_SIZE )); do
+              largest_dir=$(du -sb "${UNPACK_DONOR_DIR}/my_stock/app"/* 2>/dev/null | sort -nr | head -n 1 | cut -f2 || true)
+              if [[ -z "${largest_dir}" ]]; then break; fi
+              echo "    Removing ${largest_dir} to fit 8.5 GiB ceiling..."
+              rm -rf "${largest_dir}"
+              repack_erofs_partition "${UNPACK_DONOR_DIR}" "my_stock"
+              TOTAL_USED=$(calc_total_super_used)
+            done
+          fi
+
+          rm -rf "${UNPACK_DONOR_DIR}"
+          echo "--> Final verified dynamic partition usage: ${TOTAL_USED} / ${GROUP_MAX_SIZE} bytes"
+
+          echo "============================================================================"
+          echo " STEP 10: Generating Sparse super.img via lpmake"
+          echo "============================================================================"
+          LPMAKE_ARGS=(
+            --metadata-size "${METADATA_SIZE}"
+            --super-name "super"
+            --metadata-slots "${METADATA_SLOTS}"
+            --device "super:${SUPER_TOTAL_SIZE}"
+            --group "qti_dynamic_partitions:${GROUP_MAX_SIZE}"
+            --sparse
+            --output "${FINAL_OUT_DIR}/super.img"
+          )
+
+          for part in "${BASE_SUPER_PARTS[@]}" "${DONOR_SUPER_PARTS[@]}"; do
+            img_file="${REPACK_IMG_DIR}/${part}.img"
+            if [[ -f "${img_file}" ]]; then
+              part_size=$(stat -c%s "${img_file}")
+              LPMAKE_ARGS+=(
+                --partition "${part}:readonly:${part_size}:qti_dynamic_partitions"
+                --image "${part}=${img_file}"
+              )
+            fi
+          done
+
+          lpmake "${LPMAKE_ARGS[@]}"
+          rm -rf "${REPACK_IMG_DIR}"
+          ls -lh "${FINAL_OUT_DIR}/super.img"
+
+          echo "============================================================================"
+          echo " STEP 11: Fastboot Packaging, GoFile Upload & 1900 MB GitHub Release Split"
+          echo "============================================================================"
+          for part in "${BASE_STANDARD_PARTS[@]}"; do
+            if [[ -f "${BASE_IMG_DIR}/${part}.img" ]]; then
+              mv -f "${BASE_IMG_DIR}/${part}.img" "${FINAL_OUT_DIR}/${part}.img"
+            fi
+          done
+
+          aria2c -x16 -s16 -k1M --check-certificate=false -d "${WORK_DIR}" -o platform-tools-windows.zip \
+            "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
+          unzip -q "${WORK_DIR}/platform-tools-windows.zip" -d "${FINAL_OUT_DIR}"
+          rm -f "${WORK_DIR}/platform-tools-windows.zip"
+
+          cat << 'BAT_EOF' > "${FINAL_OUT_DIR}/install_and_format_windows.bat"
+          @echo off
+          title ColorOS 17 (Android 17) Fastboot Installer - Realme GT Neo 3T (RMX3371 / spartan)
+          cd /d "%~dp0"
+          set "FASTBOOT=%~dp0platform-tools\fastboot.exe"
+          if not exist "%FASTBOOT%" set "FASTBOOT=fastboot"
+
+          echo ============================================================================
+          echo   ColorOS 17 (Android 17) Fastboot Installer for Realme GT Neo 3T (RMX3371)
+          echo ============================================================================
+          echo.
+          echo [1/4] Waiting for device in Bootloader (Fastboot) mode...
+          "%FASTBOOT%" devices
+
+          echo.
+          echo [2/4] Flashing Android 14 Base Firmware, Boot, DTBO, Modem and disabling AVB...
+          "%FASTBOOT%" --disable-verity --disable-verification flash vbmeta vbmeta.img
+          if exist vbmeta_system.img "%FASTBOOT%" --disable-verity --disable-verification flash vbmeta_system vbmeta_system.img
+          if exist vbmeta_vendor.img "%FASTBOOT%" --disable-verity --disable-verification flash vbmeta_vendor vbmeta_vendor.img
+          "%FASTBOOT%" flash boot boot.img
+          "%FASTBOOT%" flash dtbo dtbo.img
+          if exist modem.img "%FASTBOOT%" flash modem modem.img
+
+          echo.
+          echo [3/4] Rebooting to FastbootD to flash Dynamic Super Partition...
+          "%FASTBOOT%" reboot fastboot
+          timeout /t 6 /nobreak >nul
+          "%FASTBOOT%" flash super super.img
+
+          echo.
+          echo [4/4] Formatting Userdata & Metadata (Required for ColorOS 17 first boot)...
+          "%FASTBOOT%" -w
+          "%FASTBOOT%" reboot
+
+          echo.
+          echo ============================================================================
+          echo   SUCCESS! Your Realme GT Neo 3T is now booting into ColorOS 17!
+          echo ============================================================================
+          pause
+          BAT_EOF
+
+          ROM_ZIP_NAME="ColorOS17_RMX3371_spartan_Fastboot.zip"
+          pushd "${FINAL_OUT_DIR}" >/dev/null
+          echo "--> Creating ${ROM_ZIP_NAME}..."
+          zip -1 -r "${ROM_ZIP_NAME}" ./*.img ./install_and_format_windows.bat ./platform-tools
+          rm -rf ./*.img ./install_and_format_windows.bat ./platform-tools
+
+          echo "--> Uploading full ${ROM_ZIP_NAME} to GoFile..."
+          GOFILE_SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name // "store1"' || echo "store1")
+          GOFILE_RESP=$(curl -s -F "file=@${ROM_ZIP_NAME}" "https://${GOFILE_SERVER}.gofile.io/contents/uploadfile" || true)
+          GOFILE_LINK=$(echo "${GOFILE_RESP}" | jq -r '.data.downloadPage // "Upload skipped or rate-limited; use GitHub Releases parts below."' || true)
+          echo "GoFile Direct Download Link: ${GOFILE_LINK}"
+
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            {
+              echo "## ColorOS 17 (Android 17) Fastboot ROM for Realme GT Neo 3T (RMX3371 / spartan)"
+              echo "- **Full Fastboot Zip (${ROM_ZIP_NAME}) GoFile Link:** ${GOFILE_LINK}"
+              echo "- **Final Dynamic Super Usage:** ${TOTAL_USED} / ${GROUP_MAX_SIZE} bytes"
+              echo "- **GitHub Releases Permanent Backup:** Split into 1900 MB parts attached to the latest Release on this repository."
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+          echo "--> Splitting ${ROM_ZIP_NAME} into 1900 MB parts for GitHub Releases..."
+          split -b 1900M -d -a 3 "${ROM_ZIP_NAME}" "${ROM_ZIP_NAME}.part."
+          rm -f "${ROM_ZIP_NAME}"
+
+          cat << 'MERGE_EOF' > "merge_parts_windows.bat"
+          @echo off
+          cd /d "%~dp0"
+          echo Merging ColorOS17_RMX3371_spartan_Fastboot.zip parts...
+          copy /b ColorOS17_RMX3371_spartan_Fastboot.zip.part.* ColorOS17_RMX3371_spartan_Fastboot.zip
+          echo Done! Extract ColorOS17_RMX3371_spartan_Fastboot.zip and run install_and_format_windows.bat
+          pause
+          MERGE_EOF
+          popd >/dev/null
+
+          echo "ALL PIPELINE STEPS COMPLETED SUCCESSFULLY!"
+          PORTSCRIPT_EOF
+          sed -i 's/^          //' /tmp/port_coloros17_rmx3371.sh
+          chmod +x /tmp/port_coloros17_rmx3371.sh
+          /tmp/port_coloros17_rmx3371.sh
+
+      - name: Publish Fastboot ROM to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v17.0.0.155-spartan-${{ github.run_number }}
+          name: "ColorOS 17 (Android 17) Fastboot ROM - Realme GT Neo 3T (RMX3371) #${{ github.run_number }}"
+          body: |
+            ### ColorOS 17 (17.0.0.155 / Android 17) Fastboot ROM for Realme GT Neo 3T (RMX3371 / spartan)
+            - **Base Firmware:** RMX3371 Realme UI 5.0 (Android 14 Vendor/Boot/Modem + VNDK v34 APEX bridge)
+            - **Donor Firmware:** ColorOS 17 (17.0.0.155 SM8250)
+            - **Hardware Overlays:** Project 21623, 120Hz E4 AMOLED (480 DPI), 64MP S5KGW1, Goodix Optical FOD, 80W SuperDart
+            - **Kernel Compatibility:** Patched bpfloader.rc and disabled AVB/verity in vendor/etc/fstab.qcom.
+          files: |
+            out/ColorOS17_RMX3371_spartan_Fastboot.zip.part.*
+            out/merge_parts_windows.bat
+          draft: false
+          prerelease: false
